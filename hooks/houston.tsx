@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, On, Timer } from 'claude-code'
+import type { AgentInfo, EngineInterface, On, Timer } from 'claude-code'
 
 import type { Checklist, ChecklistTask, RunningAgent, TaskStatus } from '../types'
 import { ACCENT, AGENT_H, CARD_H, CLAY, DONE, IDLE, STEP_H, WAIT, agentSvg, cardSvg, colorOf, costOf, fmtCost, fmtTokens, laneOf, modelName, stepSvg } from './drawing'
@@ -15,6 +15,8 @@ const METER = 10
 const MAX_NAME = 40
 const FALLBACK_ID = 'fallback'
 const PLACEHOLDER_PREFIX = 'placeholder:'
+const LIVE_STATUSES = new Set(['pending', 'running', 'waiting'])
+const WAKE_ORIGINS = new Set(['task-notification', 'auto-continuation'])
 
 const enabled = atom({ plugin: 'houston', key: 'enabled' } as const, true)
 const checklist = atom({ plugin: 'houston', key: 'checklist' } as const, null)
@@ -53,6 +55,8 @@ const finish = (task: ChecklistTask): ChecklistTask => ({ ...task, status: 'done
 const isReal = (task: ChecklistTask) => task.id !== FALLBACK_ID && !task.id.startsWith(PLACEHOLDER_PREFIX)
 
 const hasPlan = (c: Checklist) => c.tasks.some(isReal)
+
+const rested = (tasks: ChecklistTask[]): ChecklistTask[] => tasks.map(t => (t.status === 'active' ? { ...t, status: 'upcoming' } : t))
 
 const withOneActive = (tasks: ChecklistTask[]): ChecklistTask[] => {
   if (tasks.some(t => t.status === 'active')) return tasks
@@ -134,15 +138,23 @@ let ticker: Timer | undefined
 let remindedFor: number | undefined
 let failStreak = 0
 let lastWasCommand = false
+let lastWasTyped = false
 let apiError: string | undefined
 
-const syncTicker = ($: $, c: Checklist | null) => {
-  const isLive = c !== null && (c.phase === 'working' || c.phase === 'needsYou')
-  if (isLive && !ticker) ticker = $.clock.every(250, () => void update($, tick, n => n + 1))
+const syncTicker = async ($: $, c: Checklist | null) => {
+  const isLive = (c !== null && (c.phase === 'working' || c.phase === 'needsYou')) || (await listedLive($)).length > 0
+  if (isLive && !ticker) ticker = $.clock.every(250, () => void pulse($))
   if (!isLive && ticker) {
     ticker.cancel()
     ticker = undefined
   }
+}
+
+const resync = async ($: $) => syncTicker($, await read($, checklist))
+
+const pulse = async ($: $) => {
+  await update($, tick, n => n + 1)
+  await resync($)
 }
 
 const setChecklist = async ($: $, change: (c: Checklist) => Checklist) =>
@@ -152,7 +164,7 @@ const startJob = async ($: $, prompt: string) => {
   const startedAt = await $.clock.now()
   failStreak = 0
   apiError = undefined
-  syncTicker($, await update($, checklist, () => newJob(prompt, startedAt)))
+  await syncTicker($, await update($, checklist, () => newJob(prompt, startedAt)))
   if ((await read($, enabled)) && !(await read($, isPaneDismissed))) void $.ui.open({ id: PANE, title: 'Houston' })
   $.clock.after(0, () => void nameJob($, prompt, startedAt))
 }
@@ -184,8 +196,34 @@ const end = async ($: $, change: (c: Checklist) => Checklist) => {
   await setChecklist($, c => change({ ...c, finishedAt }))
 }
 
-const track = ($: $, id: string, change: (a: RunningAgent) => RunningAgent) =>
-  update($, running, list => list.map(a => (a.id === id ? change(a) : a)))
+const seenAt = new Map<string, number>()
+
+const firstSeen = (id: string, now: number) => seenAt.get(id) ?? (seenAt.set(id, now), now)
+
+const fromInfo = (info: Pick<AgentInfo, 'id' | 'type' | 'description'>, startedAt: number): RunningAgent => ({
+  id: info.id,
+  type: info.type,
+  description: info.description,
+  startedAt,
+  model: '',
+  tokens: 0,
+  costUsd: 0,
+})
+
+const track = async ($: $, id: string, change: (a: RunningAgent) => RunningAgent) => {
+  const info = (await $.agent.list()).find(a => a.id === id) ?? { id, type: '', description: '' }
+  const entry = fromInfo(info, firstSeen(id, await $.clock.now()))
+  await update($, running, list => (list.some(a => a.id === id) ? list : [...list, entry]).map(a => (a.id === id ? change(a) : a)))
+  await resync($)
+}
+
+const listedLive = async ($: $) => (await $.agent.list()).filter(a => LIVE_STATUSES.has(a.status))
+
+const liveAgents = async ($: $) => {
+  const tracked = new Map((await read($, running)).map(a => [a.id, a] as const))
+  const now = await $.clock.now()
+  return (await listedLive($)).map(info => tracked.get(info.id) ?? fromInfo(info, firstSeen(info.id, now)))
+}
 
 const setEnabled = async ($: $, value: boolean) => {
   await update($, enabled, () => value)
@@ -261,17 +299,23 @@ export const registerHouston = (on: On) => {
 
   on('prompt.submit', ($, e, next) => {
     lastWasCommand = e.text.trimStart().startsWith('/')
+    lastWasTyped = e.isMeta !== true && !WAKE_ORIGINS.has(e.origin.kind)
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
+    if (e.agentId !== undefined) return next(e)
+    const alive = new Set((await listedLive($)).map(a => a.id))
+    await update($, running, list => list.filter(a => alive.has(a.id)))
     const isCommand = lastWasCommand
+    const isTyped = lastWasTyped
     lastWasCommand = false
+    lastWasTyped = false
     if (e.text === '' || isCommand) return next(e)
     const current = await read($, checklist)
-    const isReply = current?.phase === 'needsYou' && current.tasks.some(t => isReal(t) && t.status !== 'done')
-    if (isReply) await setChecklist($, c => ({ ...c, phase: 'working', needsYouReason: null, finishedAt: null }))
-    else await startJob($, e.text)
+    const isOpen = current?.tasks.some(t => isReal(t) && t.status !== 'done') === true
+    if (isOpen && (!isTyped || current?.phase === 'needsYou')) await setChecklist($, c => ({ ...c, phase: 'working', needsYouReason: null, finishedAt: null }))
+    else if (isTyped) await startJob($, e.text)
     return next(e)
   })
 
@@ -372,18 +416,23 @@ export const registerHouston = (on: On) => {
     }
     switch (e.reason) {
       case 'error':
-        await end($, c => ({ ...c, phase: 'stuck', stuckReason: apiError ?? 'something went wrong, try again', needsYouReason: null }))
+        await end($, c => ({ ...c, phase: 'stuck', tasks: rested(c.tasks), stuckReason: apiError ?? 'something went wrong, try again', needsYouReason: null }))
         break
       case 'refusal':
-        await end($, c => ({ ...c, phase: 'stuck', stuckReason: "Claude couldn't help with that request", needsYouReason: null }))
+        await end($, c => ({ ...c, phase: 'stuck', tasks: rested(c.tasks), stuckReason: "Claude couldn't help with that request", needsYouReason: null }))
         break
       case 'aborted':
-        await end($, c => ({ ...c, phase: 'stopped', needsYouReason: null }))
+        await end($, c => ({ ...c, phase: 'stopped', tasks: rested(c.tasks), needsYouReason: null }))
         break
       case 'answer': {
         const c = await read($, checklist)
         if (c?.tasks.some(t => isReal(t) && t.status !== 'done')) {
-          await setChecklist($, x => ({ ...x, phase: 'needsYou', needsYouReason: 'Claude is waiting for your reply' }))
+          const isDelegating = (await listedLive($)).length > 0
+          await setChecklist($, x =>
+            isDelegating
+              ? { ...x, phase: 'working', needsYouReason: null }
+              : { ...x, phase: 'needsYou', needsYouReason: 'Claude is waiting for your reply' },
+          )
           break
         }
         await end($, x => ({ ...x, phase: 'done', tasks: x.tasks.map(finish), needsYouReason: null, stuckReason: null }))
@@ -396,9 +445,9 @@ export const registerHouston = (on: On) => {
 
   on('agent.spawn', async ($, e, next) => {
     const started = await next(e)
-    if (started.deny !== undefined) return started
+    if (started.deny !== undefined || started.agentId === undefined) return started
     const agent = {
-      id: started.agentId ?? e.tool_use_id,
+      id: started.agentId,
       type: e.subagentType,
       description: e.description,
       startedAt: await $.clock.now(),
@@ -407,6 +456,7 @@ export const registerHouston = (on: On) => {
       costUsd: 0,
     }
     await update($, running, list => [...list.filter(a => a.id !== agent.id), agent])
+    await resync($)
     return started
   })
 
@@ -435,8 +485,8 @@ export const registerHouston = (on: On) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
     const c = await read($, checklist)
-    if (c === null) return <ui.Text dimColor>Nothing running</ui.Text>
-    const cards = await workerCards($, ui, e.surface, e.props.bodyColumns, await read($, running))
+    const cards = await workerCards($, ui, e.surface, e.props.bodyColumns, await liveAgents($))
+    if (c === null) return cards.length === 0 ? <ui.Text dimColor>Nothing running</ui.Text> : <ui.Box flexDirection="column">{agentGroup(ui, cards)}</ui.Box>
     return (
       <ui.Box flexDirection="column">
         <ui.Box key="header">{headerFor(ui.Text, c, await $.clock.now())}</ui.Box>
@@ -474,24 +524,18 @@ export const registerHouston = (on: On) => {
     const pane = (await $.ui.panes()).find(p => p.id === PANE)
     const inPane = pane?.isPlaced === true && pane.isShown
 
-    if (c === null || c.isCollapsed || inPane) {
-      return (
-        <Box flexDirection="row" justifyContent="space-between">
-          {header}
-          {button}
-        </Box>
-      )
-    }
-
-    const below = await agentRows($, ui, e.surface, e.props.bodyColumns, await read($, running), 2)
-
-    return (
+    const below = isOn && !inPane ? await agentRows($, ui, e.surface, e.props.bodyColumns, await liveAgents($), 2) : []
+    const top = (
+      <Box flexDirection="row" justifyContent="space-between">
+        {header}
+        {button}
+      </Box>
+    )
+    const rows = c === null || c.isCollapsed || inPane ? agentGroup(ui, below) : stepRows(ui, e.surface, e.props.bodyColumns, c, frame, below)
+    return rows.length === 0 ? top : (
       <Box flexDirection="column">
-        <Box flexDirection="row" justifyContent="space-between">
-          {header}
-          {button}
-        </Box>
-        {stepRows(ui, e.surface, e.props.bodyColumns, c, frame, below)}
+        {top}
+        {rows}
       </Box>
     )
   })
@@ -505,7 +549,7 @@ const stepRows = (ui: Ui, surface: string, cols: number, c: Checklist, frame: nu
   const W = Math.max(180, Math.min(1600, cols * 8 - 16))
   const nameWidth = Math.max(8, cols - (2 + 1 + METER + 2 + 7))
   const firstUpcoming = c.tasks.findIndex(t => t.status === 'upcoming')
-  return c.tasks.flatMap((task, i) => {
+  const rows = c.tasks.flatMap((task, i) => {
     const icon = task.status === 'done' ? '✓' : task.status === 'active' ? (c.phase === 'needsYou' ? '‖' : '▶') : '○'
     const label =
       task.status === 'done'
@@ -545,7 +589,11 @@ const stepRows = (ui: Ui, surface: string, cols: number, c: Checklist, frame: nu
       ...under,
     ]
   })
+  return c.tasks.some(t => t.status === 'active') ? rows : [...rows, ...agentGroup(ui, below)]
 }
+
+const agentGroup = ({ Box, Text }: Ui, rows: Awaited<ReturnType<typeof agentRows>>) =>
+  rows.length === 0 ? [] : [<Box key="agents"><Text dimColor>Agents</Text></Box>, ...rows]
 
 const agentRows = async ($: $, ui: Ui, surface: string, cols: number, list: readonly RunningAgent[], indent = 0) => {
   const { Box, Text } = ui

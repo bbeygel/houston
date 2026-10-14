@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { costOf, costumeOf } from '../hooks/drawing'
@@ -17,13 +17,17 @@ const BAND = {
 const PLACED = [{ id: 'houston', title: 'Houston', isShown: true, isFocused: false, isPlaced: true }]
 const USAGE = { input_tokens: 9000, output_tokens: 2000, cache_read_input_tokens: 1000, cache_creation_input_tokens: 400, model: 'claude-opus-5-5' }
 
-const world = (on: On, panes: Record<string, unknown>[] = []) => {
+let clock: MockClock
+
+const world = (on: On, panes: Record<string, unknown>[] = [], agents: Record<string, string> = {}) => {
   const calls = { opens: 0, closes: 0 }
-  mock.clock(on)
+  clock = mock.clock(on)
   mock.store(on)
   on('ui.open', () => ((calls.opens += 1), { value: { isPlaced: true } }) as never)
   on('ui.close', () => ((calls.closes += 1), { value: undefined }) as never)
   on('ui.panes', () => ({ value: panes }) as never)
+  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
+  on('agent.list', () => ({ value: Object.entries(agents).map(([id, status]) => ({ id, status, type: 'general-purpose', description: `Agent ${id}` })) }) as never)
   on('turn.start', (_$, e) => ({ turnId: e.turnId }))
   on('tool.call', (_$, e) => (e.tool === 'TodoWrite' ? { result: { oldTodos: [], newTodos: e.todos } } : { result: 'ok' }) as never)
   on('classic.Notification', () => ({}))
@@ -42,7 +46,12 @@ const row = async (ui: Drawing, key: string, name: string) =>
     ? (await ui.find({ key }))?.text
     : (await ui.findAll({ type: 'Svg' })).map(svg => String(svg.props.alt)).find(alt => alt.includes(name))
 
-const startJob = ($: Engine) => $.turn.start({ text: 'Build my landing page', turnId: 't1' })
+const typed = async ($: Engine, text: string, turnId: string) => {
+  await $.prompt.submit({ text, wait: false, origin: { kind: 'composer' } } as never)
+  return $.turn.start({ text, turnId })
+}
+
+const startJob = ($: Engine) => typed($, 'Build my landing page', 't1')
 
 const call = ($: Engine, tool: string, input: Record<string, unknown>) => $.tool.call({ tool, ...input } as never)
 
@@ -116,7 +125,8 @@ const modelStep = async ($: Engine, agentId: string) => {
 }
 
 test('a placed pane holds the whole checklist and the cards, and the band is one line', async ($, on) => {
-  const calls = world(on, PLACED)
+  const agents: Record<string, string> = { a1: 'running' }
+  const calls = world(on, PLACED, agents)
   spawned(on)
   stepped(on)
   on('turn.complete', () => ({ text: 'done' }))
@@ -145,6 +155,7 @@ test('a placed pane holds the whole checklist and the cards, and the band is one
   const desktopPane = await $.ui.mount({ ...(PANE_ROWS as object), surface: 'desktop' } as never)
   expect(await row(desktopPane as never, 'row-0', 'Read the code')).toContain('▶')
   expect(await row(desktopPane as never, 'card-a1', 'Port the bars')).toContain('12k tokens · ≈$0.08')
+  agents.a1 = 'completed'
   await $.turn.complete({ agentId: 'a1', reason: 'answer', answer: 'done', durationMs: 1, isAborted: false, turnId: 'a1-turn' })
   expect(await row(pane as never, 'card-a1', 'Port the bars')).toBeUndefined()
   expect(calls.closes).toBe(0)
@@ -157,7 +168,7 @@ test('the pane says Nothing running before any job', async ($, on) => {
 })
 
 test('with no pane placed the step rows and the compact agent row stay in the band', async ($, on) => {
-  world(on)
+  world(on, [], { a1: 'running' })
   spawned(on)
   await startJob($)
   await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
@@ -176,13 +187,13 @@ test('with no pane placed the step rows and the compact agent row stay in the ba
 test('each job opens the pane, Houston off closes it and a job while off leaves it shut', async ($, on) => {
   const calls = world(on, PLACED)
   await startJob($)
-  await $.turn.start({ text: 'Fix my footer', turnId: 't2' })
+  await typed($, 'Fix my footer', 't2')
   expect(calls).toEqual({ opens: 2, closes: 0 })
   await $.command.run({ command: 'houston', args: 'off' } as never)
-  await $.turn.start({ text: 'Fix my header', turnId: 't3' })
+  await typed($, 'Fix my header', 't3')
   expect(calls).toEqual({ opens: 2, closes: 1 })
   await $.command.run({ command: 'houston', args: 'on' } as never)
-  await $.turn.start({ text: 'Fix my menu', turnId: 't4' })
+  await typed($, 'Fix my menu', 't4')
   expect(calls).toEqual({ opens: 3, closes: 1 })
 })
 
@@ -242,4 +253,215 @@ test('the reminder is given once, then work goes on with a fallback row', async 
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await ui.find({ key: 'row-0' }))?.text).toContain('Working on it')
   expect(await ui.find({ key: 'row-1' })).toBeUndefined()
+})
+
+type Surface = 'terminal' | 'desktop'
+
+const seen = async ($: Engine, props: object, surface: Surface, key: string, name: string) => {
+  const ui = (await $.ui.mount({ ...props, surface } as never)) as never as Drawing & { unmount: () => Promise<void> }
+  const text = await row(ui, key, name)
+  await ui.unmount()
+  return text
+}
+
+const inBand = ($: Engine, surface: Surface, key: string, name = '') => seen($, BAND, surface, key, name)
+
+const inPane = ($: Engine, surface: Surface, key: string, name = '') => seen($, PANE_ROWS as object, surface, key, name)
+
+const finishTurn = ($: Engine, reason: 'answer' | 'aborted' | 'error') =>
+  $.turn.complete({ reason, answer: '', durationMs: 1, isAborted: reason === 'aborted', turnId: 't1' } as never)
+
+const paneKeys = async ($: Engine) => {
+  const ui = await $.ui.mount({ ...(PANE_ROWS as object), surface: 'terminal' } as never)
+  const tree = (await ui.drawn()) as unknown as { children: { props: { key: string } }[] }
+  await ui.unmount()
+  return tree.children.map(child => child.props.key)
+}
+
+test('an aborted or errored turn leaves no step running and moves the live card to the Agents group', async ($, on) => {
+  world(on, [], { a1: 'running' })
+  spawned(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  for (const reason of ['aborted', 'error'] as const) {
+    await startJob($)
+    await call($, PLAN, { steps: ['Read your brand notes', 'Build the pricing section', 'Add the contact form'] })
+    await call($, PROGRESS, { task: 'Read your brand notes', percent: 100 })
+    await spawn($, 'a1', 'Port the bars')
+    expect(await inPane($, 'terminal', 'card-a1')).toContain('Port the bars')
+    await finishTurn($, reason)
+    expect(await inBand($, 'terminal', 'row-0')).toContain('✓')
+    expect(await inBand($, 'terminal', 'row-1')).toContain('○')
+    for (const key of ['row-1', 'row-2']) {
+      expect(await inBand($, 'terminal', key)).not.toContain('▶')
+      expect(await inPane($, 'terminal', key)).not.toContain('▶')
+    }
+    expect(await inBand($, 'terminal', 'agent-a1')).toContain('Port the bars')
+    expect(await inPane($, 'terminal', 'card-a1')).toContain('Port the bars')
+    expect(await paneKeys($)).toEqual(['header', 'row-0', 'row-1', 'row-2', 'agents', 'card-a1'])
+  }
+})
+
+test('an answer with steps left says Needs you only when none of its subagents is working', async ($, on) => {
+  const agents: Record<string, string> = { a1: 'running' }
+  world(on, [], agents)
+  spawned(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await spawn($, 'a1', 'Port the bars')
+  await finishTurn($, 'answer')
+  expect(await inBand($, 'terminal', 'header')).not.toContain('Needs you')
+  expect(await inBand($, 'terminal', 'row-0')).toContain('▶')
+  agents.a1 = 'completed'
+  await finishTurn($, 'answer')
+  expect(await inBand($, 'terminal', 'header')).toContain('Needs you')
+  expect(await inBand($, 'terminal', 'header')).toContain('Claude is waiting for your reply')
+})
+
+test('an agent the engine no longer lists draws no card, and the next turn drops what was tracked about it', async ($, on) => {
+  const agents: Record<string, string> = { a1: 'running' }
+  world(on, [], agents)
+  spawned(on)
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await spawn($, 'a1', 'Port the bars')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await inBand($, surface, 'agent-a1', 'Port the bars')).toContain('Port the bars')
+    expect(await inPane($, surface, 'card-a1', 'Port the bars')).toContain('Port the bars')
+  }
+  delete agents.a1
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await inBand($, surface, 'agent-a1', 'Port the bars')).toBeUndefined()
+    expect(await inPane($, surface, 'card-a1', 'Port the bars')).toBeUndefined()
+  }
+  await typed($, 'Fix my footer', 't2')
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  agents.a1 = 'running'
+  expect(await inBand($, 'terminal', 'agent-a1')).toContain('Agent a1')
+  expect(await inBand($, 'terminal', 'agent-a1')).not.toContain('Port the bars')
+})
+
+test('a spawn that started no agent is not tracked', async ($, on) => {
+  world(on, [], { 'tu-a1': 'running' })
+  on('agent.spawn', () => ({ model: 'claude-opus-5-5' }) as never)
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await spawn($, 'a1', 'Port the bars')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(String(await inBand($, surface, 'agent-tu-a1', 'Port the bars'))).not.toContain('Port the bars')
+    expect(String(await inPane($, surface, 'card-tu-a1', 'Port the bars'))).not.toContain('Port the bars')
+  }
+})
+
+test('a subagent turn start leaves the checklist alone', async ($, on) => {
+  world(on)
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await $.turn.start({ text: 'brief', turnId: 'a1-turn', agentId: 'a1' })
+  expect(await inBand($, 'terminal', 'row-0')).toContain('Read the code')
+  expect(await inBand($, 'terminal', 'row-0')).toContain('▶')
+  expect(await inBand($, 'terminal', 'row-1')).toContain('Build the view')
+  expect(await inBand($, 'terminal', 'header')).toContain('Build my landing page')
+})
+
+test('a wake-up turn continues the open job instead of starting a new one', async ($, on) => {
+  world(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await $.turn.start({ text: 'a background task finished', turnId: 't2' })
+  expect(await inBand($, 'terminal', 'row-0')).toContain('Read the code')
+  expect(await inBand($, 'terminal', 'header')).toContain('Build my landing page')
+  await finishTurn($, 'answer')
+  expect(await inBand($, 'terminal', 'header')).toContain('Needs you')
+  const notice = { text: '<task-notification>', wait: false, isMeta: true, origin: { kind: 'task-notification' } }
+  await $.prompt.submit(notice as never)
+  await $.turn.start({ text: notice.text, turnId: 't3' })
+  expect(await inBand($, 'terminal', 'row-0')).toContain('Read the code')
+  expect(await inBand($, 'terminal', 'header')).not.toContain('Needs you')
+  expect(await inBand($, 'terminal', 'header')).toContain('Build my landing page')
+})
+
+test('a typed prompt after a finished job starts a new job, and a wake-up then leaves a finished one alone', async ($, on) => {
+  world(on)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await call($, PROGRESS, { task: 'Read the code', percent: 100 })
+  await call($, PROGRESS, { task: 'Build the view', percent: 100 })
+  await finishTurn($, 'answer')
+  expect(await inBand($, 'terminal', 'header')).toContain('All done')
+  await $.turn.start({ text: 'a background task finished', turnId: 't2' })
+  expect(await inBand($, 'terminal', 'header')).toContain('All done')
+  await typed($, 'Fix my footer', 't3')
+  expect(await inBand($, 'terminal', 'header')).toContain('Fix my footer')
+  expect(await inBand($, 'terminal', 'row-0')).toContain('Understand your request')
+})
+
+test('a live agent that never went through agent.spawn shows a card and its usage accrues', async ($, on) => {
+  world(on, [], { bg1: 'running' })
+  stepped(on)
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  expect(await inPane($, 'terminal', 'card-bg1')).toContain('general-purpose · —')
+  expect(await inPane($, 'terminal', 'card-bg1')).toContain('0 tokens')
+  await modelStep($, 'bg1')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await inBand($, surface, 'agent-bg1', 'Agent bg1')).toContain('Agent bg1')
+    for (const shows of ['Agent bg1', 'general-purpose', '12k tokens · ≈$0.08']) {
+      expect(await inPane($, surface, 'card-bg1', 'Agent bg1')).toContain(shows)
+    }
+  }
+})
+
+test('an agent still live after every step is done sits in a trailing Agents group', async ($, on) => {
+  world(on, [], { bg1: 'running' })
+  on('model.complete', () => ({ value: { isAnswered: false, reason: 'api-error', status: 500, error: 'server_error' } }) as never)
+  on('turn.complete', () => ({ text: 'done' }))
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await call($, PROGRESS, { task: 'Read the code', percent: 100 })
+  await call($, PROGRESS, { task: 'Build the view', percent: 100 })
+  await finishTurn($, 'answer')
+  expect(await paneKeys($)).toEqual(['header', 'row-0', 'row-1', 'agents', 'card-bg1'])
+  for (const surface of ['terminal', 'desktop'] as const) {
+    expect(await inBand($, surface, 'agent-bg1', 'Agent bg1')).toContain('Agent bg1')
+    expect(await inPane($, surface, 'card-bg1', 'Agent bg1')).toContain('Agent bg1')
+  }
+  expect(await inBand($, 'terminal', 'header')).toContain('All done')
+  expect(await inBand($, 'terminal', 'agents')).toBe('Agents')
+  await clock.advance(5000)
+  expect(await inBand($, 'terminal', 'row-0')).toBeUndefined()
+  expect(await inBand($, 'terminal', 'agents')).toBe('Agents')
+  expect(await inBand($, 'terminal', 'agent-bg1')).toContain('Agent bg1')
+})
+
+test('with no checklist the pane shows the live agent, and nothing when none is live', async ($, on) => {
+  const agents: Record<string, string> = { bg1: 'running' }
+  world(on, [], agents)
+  expect(await inPane($, 'terminal', 'agents')).toBe('Agents')
+  expect(await inPane($, 'terminal', 'card-bg1')).toContain('Agent bg1')
+  expect(await inBand($, 'terminal', 'agent-bg1')).toContain('Agent bg1')
+  agents.bg1 = 'completed'
+  const empty = await $.ui.mount({ ...(PANE_ROWS as object), surface: 'terminal' } as never)
+  expect((await empty.find({ type: 'Text' }))?.text).toBe('Nothing running')
+})
+
+test('the pane keeps redrawing while an agent is live after the job ended', async ($, on) => {
+  const agents: Record<string, string> = { bg1: 'running' }
+  world(on, [], agents)
+  on('turn.complete', () => ({ text: 'done' }))
+  on('model.complete', () => ({ value: { isAnswered: false, reason: 'api-error', status: 500, error: 'server_error' } }) as never)
+  await startJob($)
+  await call($, PLAN, { steps: ['Read the code', 'Build the view'] })
+  await call($, PROGRESS, { task: 'Read the code', percent: 100 })
+  await call($, PROGRESS, { task: 'Build the view', percent: 100 })
+  await finishTurn($, 'answer')
+  const ui = await $.ui.mount({ ...(PANE_ROWS as object), surface: 'terminal' } as never)
+  expect((await ui.find({ key: 'card-bg1' }))?.text).toContain('· 0s')
+  await clock.advance(1000)
+  expect((await ui.find({ key: 'card-bg1' }))?.text).toContain('· 1s')
+  agents.bg1 = 'completed'
+  await clock.advance(250)
+  expect(await ui.find({ key: 'card-bg1' })).toBeUndefined()
 })
