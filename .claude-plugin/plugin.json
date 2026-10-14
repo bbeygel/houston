@@ -1,6 +1,6 @@
 {
   "name": "houston",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Replaces tool rows with a plain-English checklist of the job above the prompt, and shows a live card for each running subagent",
   "author": {
     "name": "bbeygel",
