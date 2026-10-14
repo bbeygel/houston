@@ -15,6 +15,7 @@ const COSTUME_COLOR: Record<string, string> = {
   engineer: '#BA7517',
   chef: '#378ADD',
   racer: '#1D9E75',
+  pirate: '#D4537E',
   plain: '#888780',
 }
 
