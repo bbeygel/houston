@@ -222,7 +222,72 @@ const listedLive = async ($: $) => (await $.agent.list()).filter(a => LIVE_STATU
 const liveAgents = async ($: $) => {
   const tracked = new Map((await read($, running)).map(a => [a.id, a] as const))
   const now = await $.clock.now()
-  return (await listedLive($)).map(info => tracked.get(info.id) ?? fromInfo(info, firstSeen(info.id, now)))
+  return [...(await listedLive($)).map(info => tracked.get(info.id) ?? fromInfo(info, firstSeen(info.id, now))), ...simulated]
+}
+
+const TEST_STEPS = ['Plan the work', 'Send out three workers', 'Check the results', 'Wrap up']
+const TEST_SPANS = [3000, 9000, 4000, 2000]
+const TEST_WORKERS = [
+  { type: 'fetcher', description: 'Look up the facts', model: 'claude-haiku-5-5', effort: 'low', finishesAt: 0.6, usdPerToken: 0.000001 },
+  { type: 'researcher', description: 'Dig into the details', model: 'claude-opus-5-5', effort: 'high', finishesAt: 0.8, usdPerToken: 0.000015 },
+  { type: 'implementer', description: 'Draft the change', model: 'claude-sonnet-5-5', effort: 'medium', finishesAt: 1, usdPerToken: 0.000003 },
+]
+const TEST_WORKER_STEPS = 3
+
+export const testFrame = (elapsed: number, startedAt: number) => {
+  const starts = TEST_SPANS.map((_, i) => TEST_SPANS.slice(0, i).reduce((a, b) => a + b, 0))
+  const at = starts.findLastIndex(s => elapsed >= s)
+  const within = elapsed - starts[at]!
+  const isDone = elapsed >= starts.at(-1)! + TEST_SPANS.at(-1)!
+  const tasks = TEST_STEPS.map((name, i): ChecklistTask => {
+    if (isDone || i < at) return finish(makeTask(`plan:${i}`, name, 'done'))
+    if (i > at) return makeTask(`plan:${i}`, name, 'upcoming')
+    return { ...makeTask(`plan:${i}`, name, 'active'), percent: Math.round((100 * within) / TEST_SPANS[i]!), hasReported: true }
+  })
+  const agents = at !== 1 || isDone ? [] : TEST_WORKERS.flatMap((w, j): RunningAgent[] => {
+    const stepDone = Math.min(TEST_WORKER_STEPS, Math.floor((TEST_WORKER_STEPS * within) / (TEST_SPANS[1]! * w.finishesAt)))
+    const tokens = Math.round(within * (j + 1) * 4)
+    return stepDone >= TEST_WORKER_STEPS ? [] : [{
+      id: `test:${w.type}`,
+      type: w.type,
+      description: w.description,
+      startedAt: startedAt + starts[1]!,
+      model: w.model,
+      effort: w.effort,
+      tokens,
+      costUsd: tokens * w.usdPerToken,
+      stepDone,
+      stepTotal: TEST_WORKER_STEPS,
+    }]
+  })
+  return { tasks, agents, isDone }
+}
+
+let simulated: RunningAgent[] = []
+let testTimer: Timer | undefined
+
+const stopTest = () => {
+  testTimer?.cancel()
+  testTimer = undefined
+  simulated = []
+}
+
+const runTest = async ($: $) => {
+  stopTest()
+  const startedAt = await $.clock.now()
+  await syncTicker($, await update($, checklist, () => ({ ...newJob('Houston test run', startedAt), tasks: testFrame(0, startedAt).tasks })))
+  if ((await read($, enabled)) && !(await read($, isPaneDismissed))) void $.ui.open({ id: PANE, title: 'Houston' })
+  testTimer = $.clock.every(250, () => void playTest($, startedAt))
+}
+
+const playTest = async ($: $, startedAt: number) => {
+  if ((await read($, checklist))?.startedAt !== startedAt) return stopTest()
+  const frame = testFrame((await $.clock.now()) - startedAt, startedAt)
+  simulated = frame.agents
+  if (!frame.isDone) return setChecklist($, c => ({ ...c, tasks: frame.tasks }))
+  stopTest()
+  await end($, c => ({ ...c, phase: 'done', tasks: frame.tasks }))
+  $.clock.after(5000, () => void setChecklist($, x => (x.startedAt === startedAt && x.phase === 'done' ? { ...x, isCollapsed: true } : x)))
 }
 
 const setEnabled = async ($: $, value: boolean) => {
@@ -269,8 +334,8 @@ export const registerHouston = (on: On) => {
     })
     await $.command.register({
       name: 'houston',
-      description: 'Turn Houston on or off',
-      argumentHint: '[on|off]',
+      description: 'Turn Houston on or off, or play a test run',
+      argumentHint: '[on|off|test]',
       immediate: true,
     })
     return next(e)
@@ -278,6 +343,10 @@ export const registerHouston = (on: On) => {
 
   on('command.run', { command: 'houston' }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
+    if (arg === 'test') {
+      await runTest($)
+      return { text: 'Houston test run: 4 steps and 3 pretend workers, about 18 seconds. No model calls.' }
+    }
     const value = arg === 'on' ? true : arg === 'off' ? false : !(await read($, enabled))
     await setEnabled($, value)
     return { text: `Houston is ${value ? 'on' : 'off'}.` }

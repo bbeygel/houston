@@ -17,7 +17,7 @@ Cost is an estimate from token counts and a built-in price table (`PRICES` in `h
 /plugin install houston@houston
 ```
 
-Restart Claude Code. Toggle with `/houston on|off`.
+Restart Claude Code. Toggle with `/houston on|off`. To see it work, type `/houston test`: Houston plays an 18-second pretend job with three workers, without calling the model.
 
 For a whole project, commit this to its `.claude/settings.json`:
 
