@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "houston",
+  "description": "Mission control for Claude Code sessions.",
+  "owner": {
+    "name": "bbeygel",
+    "url": "https://github.com/bbeygel"
+  },
+  "plugins": [
+    {
+      "name": "houston",
+      "description": "Replaces tool rows with a plain-English checklist of the job above the prompt, and shows a live card for each running subagent",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

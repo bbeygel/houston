@@ -5,20 +5,32 @@ A Claude Code mod that turns a session into mission control: tool rows are hidde
 - **Checklist**: Claude lays out 2 to 8 steps up front (`plan_steps`) and reports progress on each (`report_progress`).
 - **One place**: on a wide terminal the checklist lives in the Houston pane; otherwise it sits above the prompt. Never both.
 - **Worker cards**: each running subagent gets a card under the active step: a pixel worker, its lane, model, effort, tokens, estimated cost and time. Workers can report their own steps with the `step` tool.
-- **Lanes**: `architect`, `researcher`, `implementer`, `operator`, `clerk` and `fetcher` agents each get their own costume and color.
+- **Lanes**: `architect`, `researcher`, `implementer`, `operator`, `clerk`, `fetcher` and `Explore` agents each get their own costume and color.
 - **Desktop app**: step bars and cards draw as animated pixel art; the terminal gets the same content in text.
 
 Cost is an estimate from token counts and a built-in price table (`PRICES` in `hooks/drawing.ts`), not a bill.
 
 ## Install
 
-Point Claude Code at the folder, in `~/.claude/settings.json`:
-
-```json
-{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/houston" } }
+```
+/plugin marketplace add bbeygel/houston
+/plugin install houston@houston
 ```
 
 Restart Claude Code. Toggle with `/houston on|off`.
+
+For a whole project, commit this to its `.claude/settings.json`:
+
+```json
+{
+  "extraKnownMarketplaces": { "houston": { "source": { "source": "github", "repo": "bbeygel/houston" } } },
+  "enabledPlugins": { "houston@houston": true }
+}
+```
+
+Agents with a `tools:` allowlist need `mcp__houston__step` in it, or their cards never show step progress.
+
+To run a local checkout instead, set `{ "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/path/to/houston" } }` in `~/.claude/settings.json`.
 
 ## Develop
 
